@@ -1,5 +1,12 @@
 import time
-from threading import Lock
+import requests
+from threading import Thread, Lock
+from queue import Queue, Empty
+
+THREAD_POOL_SIZE = 5
+
+SYMBOLS = ('USD', 'PLN', 'EUR', 'CZK', 'NOK')
+BASES = ('USD', 'PLN', 'EUR', 'CZK', 'NOK')
 
 
 class Throttle:
@@ -21,7 +28,6 @@ class Throttle:
         self.rate = rate
         self.tokens = 0
         self.last = None
-
 
     def consume(self, amount=1):
         with self._consume_lock:
@@ -48,3 +54,68 @@ class Throttle:
                 self.tokens -= amount
                 return amount
             return 0
+
+def fetch_rates(base):
+    response = requests.get(
+        f"https://api.vatcomply.com/rates?base={base}"
+    )
+    response.raise_for_status()
+    rates = response.json()
+    rates[base] = 1
+    return base, rates
+
+def present_result(base, rates):
+    rates_line = ", ".join(
+        [f"{rates["rates"][symbol]:7.03} {symbol}" for symbol in SYMBOLS]
+    )
+    print(f"1 {base} = {rates_line}")
+
+def worker(worker_queue, results_queue, throttle):
+    while not worker_queue.empty():
+        try:
+            item = worker_queue.get_nowait()
+        except Empty:
+            break
+        while not throttle.consume():
+            time.sleep(0.1)
+        try:
+            result = fetch_rates(item)
+        except Exception as err:
+            results_queue.put(err)
+        else:
+            results_queue.put(result)
+        finally:
+            worker_queue.task_done()
+
+
+def main():
+    work_queue = Queue()
+    result_queue = Queue()
+    throttle = Throttle(10)
+
+    for base in BASES:
+        work_queue.put(base)
+
+    threads = [
+        Thread(target=worker, args=(work_queue, result_queue, throttle))
+        for _ in range(THREAD_POOL_SIZE)
+    ]
+    for thread in threads:
+        thread.start()
+
+    work_queue.join()
+
+    while threads:
+        threads.pop().join()
+
+    while not result_queue.empty():
+        present_result(*result_queue.get())
+
+
+if __name__ == '__main__':
+    started = time.time()
+    main()
+    elapsed = time.time() - started
+
+    print()
+    print("Затраченное время: {:.2f}s".format(elapsed))
